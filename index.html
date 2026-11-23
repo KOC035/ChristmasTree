@@ -101,11 +101,12 @@
         .hide-ui #fullscreen-btn:hover { opacity: 1; }
     </style>
     
+    <!-- 依赖全部本地化：不依赖任何外部 CDN，断网 / 墙内 / 内网都能直接打开 -->
     <script type="importmap">
         {
             "imports": {
-                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+                "three": "./vendor/three/three.module.js",
+                "three/addons/": "./vendor/three/addons/"
             }
         }
     </script>
@@ -143,7 +144,7 @@
         import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
         import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
         import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-        import { FilesetResolver, HandLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0';
+        import { FilesetResolver, HandLandmarker } from './vendor/mediapipe/vision_bundle.js';
 
         // --- 全局配置 ---
         const CONFIG = {
@@ -162,7 +163,6 @@
 
         const STATE = { TREE: 'tree', SCATTER: 'scatter', ZOOM: 'zoom' };
         let currentState = STATE.TREE;
-        let targetState = STATE.TREE;
         
         // --- Three.js 变量 ---
         let scene, camera, renderer, composer;
@@ -175,7 +175,6 @@
         let logicData = { gold: [], silver: [], gem: [], emerald: [], dust: [], star: null };
         const dummy = new THREE.Object3D();
         const _tempVec3 = new THREE.Vector3(); // 复用变量，减少GC
-        const _tempEuler = new THREE.Euler();
         let time = 0;
         
         // --- 交互变量 ---
@@ -516,26 +515,13 @@
         }
 
         function updatePhotoLogic() {
-            // 获取相机在 mainGroup 局部坐标系下的反向位置
-            // 用于让照片始终朝向屏幕
-            _tempVec3.copy(camera.position).applyMatrix4(mainGroup.matrixWorld.clone().invert());
-
             photoMeshes.forEach((mesh, idx) => {
                 let targetPos, targetScale = 2.0; 
                 
                 if (currentState === STATE.ZOOM && idx === zoomTargetIndex) {
-                    // 1. 计算镜头正前方80单位的世界坐标
-                    const worldTarget = new THREE.Vector3(0, 0, 80);
-                    worldTarget.applyMatrix4(camera.matrixWorld); // 转换到世界坐标(如果相机动了)
-                    
-                    // 简单做法：直接取相机Z轴前方固定距离
-                    // 由于 mainGroup 在转动，我们需要求这一点的局部坐标
-                    // 实际上让照片飞到 (0,0,80) 相对于相机的点更简单，但为了保持层级，我们转换坐标
-                    
-                    // 简化策略：将目标设为相机前方，并应用 group 的逆变换
-                    const camFront = new THREE.Vector3(0, 0, 80); // 相机空间
-                    camFront.applyMatrix4(camera.matrixWorld); // 世界空间
-                    targetPos = mainGroup.worldToLocal(camFront); // 局部空间
+                    // 相机前方固定距离的那一点，转到 mainGroup 的局部坐标后让照片飞过去
+                    _tempVec3.set(0, 0, 80).applyMatrix4(camera.matrixWorld);
+                    targetPos = mainGroup.worldToLocal(_tempVec3);
 
                     targetScale = 5.0;
                     mesh.lookAt(camera.position); // 始终朝向相机
@@ -564,29 +550,48 @@
 
         // --- 交互系统 (MediaPipe) ---
         async function setupMediaPipe() {
+            const loadingEl = document.getElementById('loading');
             try {
-                const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
-                const handLandmarker = await HandLandmarker.createFromOptions(vision, {
-                    baseOptions: {
-                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
-                        delegate: "GPU"
-                    },
-                    runningMode: "VIDEO", numHands: 1
-                });
-                
+                // 1) 先拿摄像头：没有画面就没必要加载模型
                 const video = document.getElementById("input-video");
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
+                });
                 video.srcObject = stream;
-                
-                video.addEventListener("loadeddata", () => {
-                    document.getElementById('loading').style.display = 'none';
+
+                // 2) 加载本地模型（GPU 推理在部分核显上会失败，自动退回 CPU）
+                const vision = await FilesetResolver.forVisionTasks("./vendor/mediapipe/wasm");
+                const modelOptions = {
+                    baseOptions: { modelAssetPath: "./vendor/models/hand_landmarker.task", delegate: "GPU" },
+                    runningMode: "VIDEO", numHands: 1
+                };
+                let handLandmarker;
+                try {
+                    handLandmarker = await HandLandmarker.createFromOptions(vision, modelOptions);
+                } catch (gpuError) {
+                    console.warn("GPU 推理不可用，改用 CPU：", gpuError);
+                    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                        baseOptions: { modelAssetPath: "./vendor/models/hand_landmarker.task", delegate: "CPU" },
+                        runningMode: "VIDEO", numHands: 1
+                    });
+                }
+
+                const start = () => {
+                    loadingEl.style.display = 'none';
                     updateStatus("系统就绪，请伸手", "#0f0");
                     predictWebcam(handLandmarker, video);
-                });
+                };
+                // readyState 已经够时 loadeddata 可能已经错过，两个分支都要走
+                if (video.readyState >= 2) start();
+                else video.addEventListener("loadeddata", start, { once: true });
             } catch (error) {
                 console.error(error);
-                document.getElementById('loading').innerText = "Camera Access Denied";
-                updateStatus("无法访问摄像头", "#f00");
+                const noCamera = error && (error.name === 'NotAllowedError' || error.name === 'NotFoundError' || error.name === 'NotReadableError');
+                loadingEl.innerText = noCamera ? "NEED CAMERA" : "LOAD FAILED";
+                updateStatus(
+                    noCamera ? "无法访问摄像头：请允许摄像头权限后刷新" : "初始化失败：" + (error && error.message ? error.message : error),
+                    "#f00"
+                );
             }
         }
 
@@ -622,15 +627,14 @@
 
             if (result.landmarks && result.landmarks.length > 0) {
                 const landmarks = result.landmarks[0];
+                const worldLandmarks = result.worldLandmarks ? result.worldLandmarks[0] : null;
                 isHandPresent = true;
                 drawSkeleton(ctx, landmarks, canvas.width, canvas.height);
-                handleGesture(landmarks);
+                // 三维真值优先（手倾斜、离得远近都不影响几何比值），拿不到时退回二维
+                handleGesture(landmarks, worldLandmarks, canvas.width / canvas.height, result);
             } else {
                 isHandPresent = false;
-                // 如果没有手，自动回复一点点转速
-                if(currentState === STATE.SCATTER) {
-                   // rotationVelocity.y = THREE.MathUtils.lerp(rotationVelocity.y, 0.002, 0.05);
-                }
+                resetGesture(); // 手离开画面后重新计数，免得旧手势被续上
             }
         }
 
@@ -652,68 +656,167 @@
             }
         }
 
-        function handleGesture(landmarks) {
-            // 计算手掌中心
-            const palmX = 1 - (landmarks[0].x + landmarks[9].x) / 2; // 镜像翻转 X
-            const palmY = (landmarks[0].y + landmarks[9].y) / 2;
-            
-            // 平滑位置
+                // =====================================================================
+        // 手势判定（第 3 版）
+        //
+        // 现场问题：张开手掌在画面里滑动时，会被误判成握拳，圣诞树突然聚合。
+        // 三个原因叠在一起：
+        //   1. 旧判定用「指尖到手腕 < 0.25」这种固定阈值，手离远一点、掌面斜一点，
+        //      指尖距离就缩到阈值以下；
+        //   2. MediaPipe 的 x、y 是按画面宽高分别归一化的，横向距离被宽高比压缩，
+        //      16:9 下 x 方向只有真实值的 1/1.78；
+        //   3. 手在快速滑动时关键点会抖，个别帧看起来像蜷曲，而旧判定只看单帧。
+        //
+        // 现在的做法：
+        //   · 优先用 worldLandmarks（MediaPipe 输出的真实三维坐标，单位米）算几何，
+        //     手怎么倾斜、离镜头多远，比值都不变；拿不到时退回图像坐标 + 宽高比修正；
+        //   · 所有距离都除以「掌宽」（腕 → 中指指根），彻底去掉尺度影响；
+        //   · 握拳要求四指全部蜷曲，并且连续 6 帧命中、期间手不能快速移动；
+        //   · 张手 / 捏合同样做连续帧确认，单帧抖动不再触发状态切换。
+        //
+        // 想微调手感，只改 GESTURE 里的数字即可。
+        // =====================================================================
+        const GESTURE = {
+            pinchEnter: 0.35,   // 拇指-食指间距 / 掌宽 < 它：捏住
+            pinchExit:  0.55,   // > 它：松开（中间区间保持原状，形成滞回防抖）
+            openMin:    3,      // 伸直手指数 >= 它：张手
+            smooth:     0.45,   // 伸展度平滑系数
+            holdOpen:   3,      // 张手 / 捏合需连续命中的帧数
+            holdFist:   6,      // 握拳需连续命中的帧数（刻意更长，专门防滑动误判）
+            motionGate: 0.03,   // 手掌单帧位移超过它 = 手在快速滑动，该帧不接受「握拳」
+            minScore:   0.5     // 关键点置信度低于它，该帧不参与判定
+        };
+
+        const _fingerTips = [8, 12, 16, 20];  // 食指 / 中指 / 无名指 / 小指 指尖
+        const _fingerPips = [6, 10, 14, 18];  // 对应的 PIP 关节
+
+        const _gesture = {
+            ext: [0, 0, 0, 0],  // 四指伸展度 0~1
+            pinch: false,       // 捏合是否处于「按住」状态
+            name: 'none',       // 当前判定出的手势
+            streak: 0,          // 连续命中帧数
+            cx: 0, cy: 0,       // 上一帧手掌中心（算移动量用）
+            seeded: false,      // 是否已经记录过手掌中心
+            extReady: false     // 伸展度是否已有初值
+        };
+
+        function resetGesture() {
+            _gesture.pinch = false;
+            _gesture.name = 'none';
+            _gesture.streak = 0;
+            _gesture.seeded = false;
+            _gesture.extReady = false;
+        }
+
+        // 造一个「两点距离」函数：优先三维真值，退化为二维 + 宽高比修正
+        function makeDistance(imageLm, worldLm, aspect) {
+            if (worldLm && worldLm.length === 21) {
+                return function (i, j) {
+                    const a = worldLm[i], b = worldLm[j];
+                    const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+                    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+                };
+            }
+            return function (i, j) {
+                const a = imageLm[i], b = imageLm[j];
+                const dx = (a.x - b.x) * aspect, dy = a.y - b.y;
+                return Math.sqrt(dx * dx + dy * dy);
+            };
+        }
+
+        function handleGesture(imageLm, worldLm, aspect, result) {
+            const wrist = imageLm[0];
+            const middleBase = imageLm[9];
+
+            // 0) 手掌中心 → 挥手旋转的摇杆位置（X 镜像，符合镜像画面的直觉）
+            const palmX = 1 - (wrist.x + middleBase.x) / 2;
+            const palmY = (wrist.y + middleBase.y) / 2;
             handPos.x = handPos.x * 0.7 + palmX * 0.3;
             handPos.y = handPos.y * 0.7 + palmY * 0.3;
 
-            // 简单的手势判定算法
-            let folded = 0;
-            const tips = [8,12,16,20];
-            const bases = [5,9,13,17];
-            
-            // 指尖到指根距离判定握拳
-            tips.forEach((tipIdx, i) => { 
-                const d = Math.sqrt(
-                    Math.pow(landmarks[tipIdx].x - landmarks[0].x, 2) + 
-                    Math.pow(landmarks[tipIdx].y - landmarks[0].y, 2)
-                );
-                if(d < 0.25) folded++; 
-            });
-            
-            // 捏合检测 (食指拇指距离)
-            const dPinch = Math.sqrt(
-                Math.pow(landmarks[4].x - landmarks[8].x, 2) + 
-                Math.pow(landmarks[4].y - landmarks[8].y, 2)
-            );
-            
-            const isPinch = dPinch < 0.08;
-            const isFist = folded >= 3; 
-            const isOpen = !isFist && !isPinch;
+            // 1) 这一帧手移动了多少（用原始坐标，平滑后的会吃掉速度）
+            const cx = (wrist.x + middleBase.x) / 2;
+            const cy = (wrist.y + middleBase.y) / 2;
+            let moved = 0;
+            if (_gesture.seeded) moved = Math.sqrt((cx - _gesture.cx) ** 2 + (cy - _gesture.cy) ** 2);
+            _gesture.cx = cx; _gesture.cy = cy; _gesture.seeded = true;
 
-            // 状态机
-            if (isPinch && currentState === STATE.SCATTER) {
-                if (photoMeshes.length > 0) {
-                    switchToZoom();
-                    updateStatus("抓取照片: 聚焦回忆", "#ffd700");
-                } else {
-                    updateStatus("请先点击右下角上传照片", "#aaa");
+            // 2) 置信度太低就不参与判定（手半出画、严重遮挡时会这样）
+            let score = 1;
+            if (result) {
+                const hs = result.handednesses || result.handedness;
+                if (hs && hs[0] && hs[0][0] && typeof hs[0][0].score === 'number') score = hs[0][0].score;
+            }
+            if (score < GESTURE.minScore) return;
+
+            // 3) 量一下这只手此刻有多大：腕 → 中指指根
+            const dist = makeDistance(imageLm, worldLm, aspect);
+            const palm = dist(0, 9) || 1e-6;
+
+            // 4) 四指是否伸直：指尖比 PIP 关节离腕更远，就算伸直（与手掌大小无关）
+            for (let i = 0; i < 4; i++) {
+                const ratio = dist(_fingerPips[i], 0) > 1e-6 ? dist(_fingerTips[i], 0) / dist(_fingerPips[i], 0) : 0;
+                // ratio ≈ 0.95 以下算蜷曲，1.4 以上算伸直，中间线性过渡
+                const e = Math.min(1, Math.max(0, (ratio - 0.95) / 0.45));
+                // 第一次看到这只手时直接取初值：否则从 0 爬升的头两帧会被当成握拳
+                if (_gesture.extReady) _gesture.ext[i] += (e - _gesture.ext[i]) * GESTURE.smooth;
+                else _gesture.ext[i] = e;
+            }
+            _gesture.extReady = true;
+            let extCount = 0;
+            for (let i = 0; i < 4; i++) if (_gesture.ext[i] > 0.5) extCount++;
+
+            // 5) 捏合：拇指尖 ↔ 食指尖，除以掌宽后，手离得远近都是同一个阈值
+            const pinchRatio = dist(4, 8) / palm;
+            if (pinchRatio < GESTURE.pinchEnter) _gesture.pinch = true;
+            else if (pinchRatio > GESTURE.pinchExit) _gesture.pinch = false;
+
+            // 6) 判定手势。
+            //    · 握拳要求四指全部蜷曲（旧版允许 1 根没弯，正好给了误判空间），
+            //      而且手正在快速滑动时一律不算握拳；
+            //    · 握拳时拇指本来就贴着食指，所以「捏」额外要求中指/无名指/小指
+            //      里至少两根是伸着的，才不会把握拳认成捏合。
+            const sideExt = _gesture.ext[1] + _gesture.ext[2] + _gesture.ext[3];
+            let name = 'none';
+            if (_gesture.pinch && sideExt >= 1.2) name = 'pinch';
+            else if (extCount === 0 && moved <= GESTURE.motionGate) name = 'fist';
+            else if (extCount >= GESTURE.openMin) name = 'open';
+
+            // 7) 去抖：连续 N 帧都是同一个手势，才算真的「换了手势」
+            const need = name === 'fist' ? GESTURE.holdFist : GESTURE.holdOpen;
+            if (name === _gesture.name) _gesture.streak++;
+            else { _gesture.name = name; _gesture.streak = 1; }
+            const justSwitched = _gesture.streak === need;
+
+            // 8) 状态机：只在切换的那一帧动手，避免每帧重复设置
+            if (!justSwitched) return;
+
+            if (name === 'pinch') {
+                if (currentState === STATE.SCATTER) {
+                    if (photoMeshes.length > 0) {
+                        switchToZoom();
+                        updateStatus("捏合: 抓取照片 · 聚焦回忆", "#ffd700");
+                    } else {
+                        updateStatus("捏合: 请先点击右下角上传照片", "#aaa");
+                    }
                 }
-            } else if (isFist) {
+            } else if (name === 'fist') {
                 currentState = STATE.TREE;
                 zoomTargetIndex = -1;
                 rotationVelocity.x = 0; rotationVelocity.y = 0;
+                lastHandPos.x = handPos.x; lastHandPos.y = handPos.y;
                 updateStatus("握拳: 聚合形态", "#0f0");
-            } else if (isOpen) {
-                if (currentState === STATE.ZOOM && !isPinch) {
-                    currentState = STATE.SCATTER;
-                    zoomTargetIndex = -1;
-                } else if (currentState === STATE.TREE) {
-                    currentState = STATE.SCATTER;
-                    // 重置惯性位置避免跳变
-                    lastHandPos.x = handPos.x; lastHandPos.y = handPos.y;
-                }
+            } else if (name === 'open') {
+                zoomTargetIndex = -1;
+                currentState = STATE.SCATTER;
+                // 重置惯性位置避免跳变
+                lastHandPos.x = handPos.x; lastHandPos.y = handPos.y;
                 updateStatus("张手: 星云散开 (挥手旋转)", "#00aaff");
             }
         }
-        
+
         function switchToZoom() {
             currentState = STATE.ZOOM;
-            targetState = STATE.ZOOM;
             
             // 智能选择逻辑：选离镜头最近的照片
             if (zoomTargetIndex === -1 && photoMeshes.length > 0) {
