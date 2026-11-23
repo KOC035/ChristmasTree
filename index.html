@@ -559,22 +559,49 @@
                 });
                 video.srcObject = stream;
 
-                // 2) 加载本地模型（GPU 推理在部分核显上会失败，自动退回 CPU）
-                const vision = await FilesetResolver.forVisionTasks("./vendor/mediapipe/wasm");
-                const modelOptions = {
-                    baseOptions: { modelAssetPath: "./vendor/models/hand_landmarker.task", delegate: "GPU" },
-                    runningMode: "VIDEO", numHands: 1
-                };
-                let handLandmarker;
-                try {
-                    handLandmarker = await HandLandmarker.createFromOptions(vision, modelOptions);
-                } catch (gpuError) {
-                    console.warn("GPU 推理不可用，改用 CPU：", gpuError);
-                    handLandmarker = await HandLandmarker.createFromOptions(vision, {
-                        baseOptions: { modelAssetPath: "./vendor/models/hand_landmarker.task", delegate: "CPU" },
-                        runningMode: "VIDEO", numHands: 1
-                    });
+                // 2) 加载手势模型。优先用速度快的 CDN，失败再回退到仓库内的本地副本
+                //    （GitHub Pages 在国内大文件很慢，17MB 本地资源首次加载要几分钟）
+                const ASSET_SOURCES = [
+                    {
+                        name: "unpkg",
+                        wasm: "https://unpkg.com/@mediapipe/tasks-vision@0.10.0/wasm",
+                        model: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+                    },
+                    {
+                        name: "local",
+                        wasm: "./vendor/mediapipe/wasm",
+                        model: "./vendor/models/hand_landmarker.task"
+                    }
+                ];
+
+                // GPU 推理在部分核显上会失败，自动退回 CPU
+                async function createLandmarker(src) {
+                    const vision = await FilesetResolver.forVisionTasks(src.wasm);
+                    const common = { runningMode: "VIDEO", numHands: 1 };
+                    try {
+                        return await HandLandmarker.createFromOptions(vision, {
+                            baseOptions: { modelAssetPath: src.model, delegate: "GPU" }, ...common
+                        });
+                    } catch (gpuError) {
+                        console.warn("GPU 推理不可用，改用 CPU：", gpuError);
+                        return await HandLandmarker.createFromOptions(vision, {
+                            baseOptions: { modelAssetPath: src.model, delegate: "CPU" }, ...common
+                        });
+                    }
                 }
+
+                let handLandmarker = null, lastError = null;
+                for (const src of ASSET_SOURCES) {
+                    try {
+                        updateStatus("加载手势模型（" + src.name + "）…", "#ffd700");
+                        handLandmarker = await createLandmarker(src);
+                        break;
+                    } catch (err) {
+                        console.warn(src.name + " 资源加载失败，换下一个源：", err);
+                        lastError = err;
+                    }
+                }
+                if (!handLandmarker) throw lastError || new Error("手势模型加载失败");
 
                 const start = () => {
                     loadingEl.style.display = 'none';
